@@ -1256,10 +1256,15 @@ fn evaluate_method_call(
 mod tests {
     #[allow(unused_imports)]
     use baml_types::ir_type::TypeIR;
-    use internal_baml_diagnostics::Span;
+    use internal_baml_ast::parse_standalone_expression;
+    use internal_baml_diagnostics::{Diagnostics, SourceFile, Span};
+    use std::path::PathBuf;
 
     use super::*;
-    use crate::thir::THir;
+    use crate::hir::{self, Hir};
+    use crate::thir;
+    use crate::thir::typecheck::typecheck_expression;
+    use crate::thir::{typecheck::typecheck_returning_context, THir};
 
     fn meta() -> ExprMetadata {
         (Span::fake(), None)
@@ -1275,6 +1280,23 @@ mod tests {
         }
     }
 
+    /// Convenience function for creating THIR test fixtures.
+    fn thir_from_src(
+        src: &'static str,
+        expr: &'static str,
+    ) -> (THir<ExprMetadata>, thir::Expr<ExprMetadata>) {
+        let parser_db = crate::test::ast(src).unwrap_or_else(|e| panic!("{}", e));
+        let hir = Hir::from_ast(&parser_db.ast);
+        let mut diagnostics = Diagnostics::new(PathBuf::from("test.baml"));
+        diagnostics.set_source(&SourceFile::new_static(PathBuf::from("test.baml"), src));
+        let (thir, typing_context) = typecheck_returning_context(&hir, &mut diagnostics);
+        let expr_ast = parse_standalone_expression(expr, &mut diagnostics)
+            .expect("Failed to parse expression");
+        let expr_hir = hir::Expression::from_ast(&expr_ast);
+        let expr_thir = typecheck_expression(&expr_hir, &typing_context, &mut diagnostics);
+        (thir, expr_thir)
+    }
+
     async fn mock_llm_function(
         _fn_name: String,
         _args: Vec<BamlValue>,
@@ -1285,8 +1307,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_atom_int() {
-        let thir = empty_thir();
-        let expr = Expr::Value(BamlValueWithMeta::Int(1, meta()));
+        let (thir, expr) = thir_from_src("", "1");
         let out = super::interpret_thir(thir, expr, mock_llm_function, BamlMap::new())
             .await
             .unwrap();
@@ -1769,7 +1790,7 @@ mod tests {
         // Test the exact same pattern as StoreFnCallInLocalVar function
         // function StoreFnCallInLocalVar(n: int) -> int {
         //     let result = ReturnNumber(n);
-        //     
+        //
         //     result
         // }
 
@@ -1951,7 +1972,7 @@ mod tests {
         use crate::hir::Hir;
         use crate::thir::typecheck::typecheck;
         use internal_baml_diagnostics::Diagnostics;
-        use internal_baml_parser_database::{parse_and_diagnostics};
+        use internal_baml_parser_database::parse_and_diagnostics;
 
         let baml_code = r#"
             function AssignElseIfExpr(a: bool, b: bool) -> int {
@@ -1968,14 +1989,14 @@ mod tests {
         "#;
 
         // Parse BAML code to AST
-        let (db, parse_diagnostics) = parse_and_diagnostics(baml_code)
-            .expect("Failed to parse BAML code");
-        
+        let (db, parse_diagnostics) =
+            parse_and_diagnostics(baml_code).expect("Failed to parse BAML code");
+
         if parse_diagnostics.has_errors() {
             let errors = parse_diagnostics.to_pretty_string();
             panic!("Parse errors: {errors}");
         }
-        
+
         let ast = db.ast().clone();
 
         // Convert AST to HIR
@@ -2012,8 +2033,7 @@ mod tests {
         };
 
         let result =
-            super::interpret_thir(thir.clone(), call_expr, mock_llm_function, BamlMap::new())
-                .await;
+            super::interpret_thir(thir.clone(), call_expr, mock_llm_function, BamlMap::new()).await;
 
         match result {
             Ok(BamlValueWithMeta::Int(actual, _)) => {
@@ -2038,23 +2058,24 @@ mod tests {
         use crate::hir::Hir;
         use crate::thir::typecheck::typecheck;
         use internal_baml_diagnostics::Diagnostics;
-        use internal_baml_parser_database::{parse_and_diagnostics};
+        use internal_baml_parser_database::parse_and_diagnostics;
 
         let baml_code = r#"
             function BoolToIntWithIfElse(b: bool) -> int {
-                if (b) { 1 } else { 0 }
+                let result = if (b) { 1 } else { 0 };
+                result
             }
         "#;
 
         // Parse and compile BAML code
-        let (db, parse_diagnostics) = parse_and_diagnostics(baml_code)
-            .expect("Failed to parse BAML code");
-        
+        let (db, parse_diagnostics) =
+            parse_and_diagnostics(baml_code).expect("Failed to parse BAML code");
+
         if parse_diagnostics.has_errors() {
             let errors = parse_diagnostics.to_pretty_string();
             panic!("Parse errors: {errors}");
         }
-        
+
         let ast = db.ast().clone();
         let hir = Hir::from_ast(&ast);
         let mut diagnostics = Diagnostics::new("test".into());
@@ -2074,7 +2095,10 @@ mod tests {
 
         println!("Function THIR: {}", function.body.dump_str());
         println!("Statements count: {}", function.body.statements.len());
-        println!("Has trailing expr: {}", function.body.trailing_expr.is_some());
+        println!(
+            "Has trailing expr: {}",
+            function.body.trailing_expr.is_some()
+        );
 
         if let Some(trailing_expr) = &function.body.trailing_expr {
             println!("Trailing expr: {}", trailing_expr.dump_str());
@@ -2084,14 +2108,12 @@ mod tests {
         let call_expr = Expr::Call {
             func: Arc::new(Expr::Var("BoolToIntWithIfElse".to_string(), meta())),
             type_args: vec![],
-            args: vec![
-                Expr::Value(BamlValueWithMeta::Bool(true, meta())),
-            ],
+            args: vec![Expr::Value(BamlValueWithMeta::Bool(true, meta()))],
             meta: meta(),
         };
 
-        let result = super::interpret_thir(thir.clone(), call_expr, mock_llm_function, BamlMap::new())
-            .await;
+        let result =
+            super::interpret_thir(thir.clone(), call_expr, mock_llm_function, BamlMap::new()).await;
 
         match result {
             Ok(value) => {
@@ -2109,5 +2131,90 @@ mod tests {
         }
 
         println!("✅ BoolToIntWithIfElse debug test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_iterative_fibonacci() {
+        // Test the iterative Fibonacci function implementation
+        use crate::hir::Hir;
+        use crate::thir::typecheck::typecheck;
+        use internal_baml_diagnostics::Diagnostics;
+        use internal_baml_parser_database::parse_and_diagnostics;
+
+        let baml_code = r#"
+            function IterativeFibonacci(n: int) -> int {
+                let a = 0;
+                let b = 1;
+
+                let result = if (n == 0) {
+                    b
+                } else {
+                    let i = 1;
+                    while (i <= n) {
+                        let c = a + b;
+                        a = b;
+                        b = c;
+                        i += 1;
+                    }
+                    a
+                };
+                result
+            }
+        "#;
+
+        // Parse and compile BAML code
+        let (db, parse_diagnostics) =
+            parse_and_diagnostics(baml_code).expect("Failed to parse BAML code");
+
+        if parse_diagnostics.has_errors() {
+            let errors = parse_diagnostics.to_pretty_string();
+            panic!("Parse errors: {errors}");
+        }
+
+        let ast = db.ast().clone();
+        let hir = Hir::from_ast(&ast);
+        let mut diagnostics = Diagnostics::new("test".into());
+        let thir = typecheck(&hir, &mut diagnostics);
+
+        if diagnostics.has_errors() {
+            let errors = diagnostics.to_pretty_string();
+            panic!("Compilation errors: {errors}");
+        }
+
+        // Test cases based on the expected behavior from existing tests
+        let test_cases = vec![
+            (0, 1), // IterativeFibonacci(0) = 1
+            (1, 1), // IterativeFibonacci(1) = 1
+            (2, 1), // IterativeFibonacci(2) = 1
+            (3, 2), // IterativeFibonacci(3) = 2
+            (4, 3), // IterativeFibonacci(4) = 3
+            (5, 5), // IterativeFibonacci(5) = 5
+            (6, 8), // IterativeFibonacci(6) = 8
+        ];
+
+        for (input, expected) in test_cases {
+            // Create function call: IterativeFibonacci(input)
+            let call_expr = Expr::Call {
+                func: Arc::new(Expr::Var("IterativeFibonacci".to_string(), meta())),
+                type_args: vec![],
+                args: vec![Expr::Value(BamlValueWithMeta::Int(input, meta()))],
+                meta: meta(),
+            };
+
+            let result =
+                super::interpret_thir(thir.clone(), call_expr, mock_llm_function, BamlMap::new())
+                    .await;
+
+            match result {
+                Ok(BamlValueWithMeta::Int(actual, _)) => {
+                    assert_eq!(
+                        actual, expected,
+                        "IterativeFibonacci({input}) should be {expected}, got {actual}"
+                    );
+                }
+                Ok(v) => panic!("Expected int result for IterativeFibonacci({input}), got {v:?}"),
+                Err(e) => panic!("Function call failed for IterativeFibonacci({input}): {e}"),
+            }
+        }
     }
 }
